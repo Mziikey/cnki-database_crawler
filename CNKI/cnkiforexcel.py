@@ -5986,6 +5986,7 @@ def create_chrome_driver(download_dir):
         chrome_options.add_argument('--no-default-browser-check')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_launcher.apply_fallback_options(chrome_options)
         driver = webdriver.Chrome(options=chrome_options)
         chrome_launcher.inject_stealth(driver)
     chrome_launcher.set_window_size(driver)

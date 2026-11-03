@@ -9,6 +9,7 @@ debugger_address 连接。配合 stealth.min.js 注入，降低无头模式下
   CNKI_HEADLESS=1        无头模式（默认有头）
   CNKI_NO_STEALTH=1      不注入 stealth.min.js（调试用）
   CNKI_CHROME_BINARY     覆盖自动探测的 Chrome 路径
+  CNKI_USER_AGENT        覆盖无头模式的 UA（默认按本机系统与 Chrome 版本生成）
   CNKI_USER_DATA_DIR     持久化登录态目录（默认复用上一次的 profile，
                          避免每次都重新 VPN/CAS 登录触发验证码）
 """
@@ -23,16 +24,70 @@ import time
 _STEALTH_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'libs', 'stealth.min.js')
 
-# 伪装成普通用户的 Chrome UA；无头时尤其重要（默认 UA 带 HeadlessChrome）
-_DEFAULT_UA = (
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
-
 WINDOW_SIZE = '1920,1080'
+
+# 不带这个参数时，JS 触发的 click()/window.open 打开新窗口会被弹窗拦截，
+# 知网 PDF 下载窗口就打不开（chromedriver 启动 Chrome 时会自动加上它）
+_POPUP_ARG = '--disable-popup-blocking'
+
+# 由本模块管理、不允许调用方 options 重复传入的启动参数前缀
+_MANAGED_ARG_PREFIXES = (
+    '--remote-debugging-port', '--headless', '--user-agent', '--window-size',
+)
 
 
 def headless_enabled() -> bool:
     return os.environ.get('CNKI_HEADLESS', '').strip().lower() in ('1', 'true', 'yes')
+
+
+def _chrome_major_version(binary: str) -> str:
+    """读取本机 Chrome 主版本号（如 156），失败返回空串。"""
+    try:
+        out = subprocess.run(
+            [binary, '--version'], capture_output=True, text=True,
+            timeout=15, check=False).stdout
+    except Exception:
+        return ''
+    for token in out.split():
+        head = token.split('.')[0]
+        if head.isdigit() and '.' in token:
+            return head
+    return ''
+
+
+def _platform_ua_token() -> str:
+    system = platform.system()
+    if system == 'Darwin':
+        return 'Macintosh; Intel Mac OS X 10_15_7'
+    if system == 'Windows':
+        return 'Windows NT 10.0; Win64; x64'
+    return 'X11; Linux x86_64'
+
+
+def headless_user_agent(binary: str) -> str:
+    """无头模式用的 UA：与本机系统、真实 Chrome 版本一致，只去掉 HeadlessChrome。
+
+    以启动参数 --user-agent 传入，对所有标签页（含知网下载/验证码新窗口）生效。
+    可用 CNKI_USER_AGENT 环境变量覆盖。
+    """
+    override = os.environ.get('CNKI_USER_AGENT', '').strip()
+    if override:
+        return override
+    major = _chrome_major_version(binary) or '131'
+    return (f'Mozilla/5.0 ({_platform_ua_token()}) AppleWebKit/537.36 '
+            f'(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36')
+
+
+def apply_fallback_options(options) -> None:
+    """chromedriver 回退模式下补上无头、UA 与弹窗参数，避免回退后又弹出窗口。"""
+    if headless_enabled():
+        options.add_argument('--headless=new')
+        options.add_argument('--window-size=' + WINDOW_SIZE)
+        binary = _detect_chrome_binary()
+        if binary and os.path.isfile(binary):
+            options.add_argument('--user-agent=' + headless_user_agent(binary))
+    if _POPUP_ARG not in options.arguments:
+        options.add_argument(_POPUP_ARG)
 
 
 def _detect_chrome_binary() -> str:
@@ -131,10 +186,16 @@ def launch_chrome_and_connect(
         return driver, None
 
     debug_port = _find_available_port(port_base)
-    if persistent:
+    caller_args = list(options.arguments)
+    caller_profile = next(
+        (a.split('=', 1)[1] for a in caller_args if a.startswith('--user-data-dir=')),
+        None)
+    if caller_profile:
+        user_data_dir = caller_profile  # 调用方的临时 profile 优先
+    elif persistent:
         user_data_dir = _persistent_profile_dir(profile_root or os.getcwd())
     else:
-        user_data_dir = None  # 由调用方 options 里已有的 --user-data-dir 决定
+        user_data_dir = None
 
     args = [
         binary,
@@ -149,17 +210,30 @@ def launch_chrome_and_connect(
         '--disable-dev-shm-usage',
         '--no-sandbox',
         '--disable-blink-features=AutomationControlled',
+        _POPUP_ARG,
         '--window-size=' + WINDOW_SIZE,
     ]
     if headless_enabled():
-        args += ['--headless=new', '--disable-gpu']
+        args += ['--headless=new', '--disable-gpu',
+                 '--user-agent=' + headless_user_agent(binary)]
     if user_data_dir:
         args.append(f'--user-data-dir={user_data_dir}')
-    # 调用方通过 options.user_data_dir 传入的目录（临时 profile）优先
-    for arg in options.arguments:
-        if arg.startswith('--user-data-dir='):
-            args.append(arg)
-            user_data_dir = arg.split('=', 1)[1]
+    # 透传调用方的其余启动参数（缓存目录、--disable-features 等）
+    for arg in caller_args:
+        if arg.startswith('--user-data-dir=') or arg in args:
+            continue
+        if arg.startswith(_MANAGED_ARG_PREFIXES):
+            continue
+        args.append(arg)
+    # 同名开关 Chrome 只认最后一个，多个 --disable-features 合并成一个
+    features = []
+    for arg in [a for a in args if a.startswith('--disable-features=')]:
+        args.remove(arg)
+        for f in arg.split('=', 1)[1].split(','):
+            if f and f not in features:
+                features.append(f)
+    if features:
+        args.append('--disable-features=' + ','.join(features))
     print(f'启动 Chrome: {binary} | debug-port={debug_port} | '
           f'headless={headless_enabled()} | user-data-dir={user_data_dir or "默认"}')
     proc = subprocess.Popen(
@@ -176,14 +250,8 @@ def launch_chrome_and_connect(
     connect_options = _copy_options_for_attach(options, debug_port)
     driver = webdriver.Chrome(options=connect_options)
     inject_stealth(driver)
-    if headless_enabled():
-        # --headless=new 的 UA 仍带 HeadlessChrome，用 CDP 覆盖成普通 Chrome UA
-        try:
-            driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-                'userAgent': os.environ.get('CNKI_USER_AGENT', _DEFAULT_UA),
-            })
-        except Exception as e:
-            print('UA 覆盖失败（无头模式下可能被识别）:', e)
+    # 无头 UA 已通过启动参数 --user-agent 设置，对所有标签页生效；
+    # 不再用 CDP Network.setUserAgentOverride（只作用于当前标签页）
     return driver, proc
 
 

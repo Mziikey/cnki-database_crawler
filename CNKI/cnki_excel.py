@@ -765,6 +765,7 @@ def create_driver(download_dir: Path):
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+        chrome_launcher.apply_fallback_options(chrome_options)
         driver = webdriver.Chrome(options=chrome_options)
         chrome_launcher.inject_stealth(driver)
     try:
@@ -1285,10 +1286,13 @@ def wait_pdf_or_unavailable(
             print('    下载过程出现验证码，开始处理...')
             if not save_dir:
                 return 'captcha', None
-            if not ensure_captcha_passed(
+            from cnkiforexcel import captcha_needs_browser_restart
+            cap = ensure_captcha_passed(
                 driver, str(save_dir), main_handle,
                 download_dir=str(download_dir), before_files=before,
-            ):
+            )
+            # 'restart_browser'（含腾讯限流）是非空字符串，不能用 not 判断
+            if captcha_needs_browser_restart(cap) or not cap:
                 return 'captcha_fail', None
             time.sleep(0.8)
             continue
@@ -1584,29 +1588,6 @@ def extract_author_org(driver) -> dict:
     return {'authors': authors, 'orgs': orgs}
 
 
-def _dump_tabs_debug(driver, tag):
-    """临时调试：转储所有标签页 URL 和下载目录内容，定位下载未触发问题。"""
-    current = None
-    try:
-        current = driver.current_window_handle
-    except Exception:
-        pass
-    try:
-        for h in list(driver.window_handles):
-            try:
-                driver.switch_to.window(h)
-                print(f'    [debug {tag}] tab {h[:8]}: {driver.current_url}')
-            except Exception as e:
-                print(f'    [debug {tag}] tab {h[:8]}: <不可读 {e}>')
-    except Exception:
-        pass
-    if current and current in driver.window_handles:
-        try:
-            driver.switch_to.window(current)
-        except Exception:
-            pass
-
-
 def download_paper(
     driver,
     url: str,
@@ -1759,7 +1740,6 @@ def download_paper(
 
             wait_for_new_window(driver, before_handles, timeout=8)
             time.sleep(1.0)
-            _dump_tabs_debug(driver, f'点击后（尝试 {attempt}/{MAX_RETRY}）')
             if has_visible_captcha_anywhere(driver) or has_unit_login_anywhere(driver):
                 if has_visible_captcha_anywhere(driver):
                     print('    检测到下载验证码页，开始处理...')
@@ -1808,7 +1788,6 @@ def download_paper(
                 return 'ok', meta
 
             print(f'    等待 PDF 超时（尝试 {attempt}/{MAX_RETRY}）')
-            _dump_tabs_debug(driver, f'超时（尝试 {attempt}/{MAX_RETRY}）')
             if not has_pdf_download_button(driver):
                 # 已点击过下载按钮（saw_pdf_button=True），超时后按钮消失
                 # 多为 WebVPN 会话/页面状态问题，不能误标「无PDF」
