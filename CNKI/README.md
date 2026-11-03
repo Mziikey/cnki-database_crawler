@@ -2,6 +2,40 @@
 
 本目录为知网题录导出、全文 PDF、验证码处理与结果统计相关脚本。
 
+## 快速开始：根据已有题录批量下载 PDF（`run/`）
+
+已经有知网导出的题录（`CNKI-*.xls`）、想批量下 PDF 并抓作者/单位时，用 `run/` 里的脚本，
+只需改一个配置文件。macOS / Linux，需要本机装好 Google Chrome。
+
+```bash
+# 1. 准备环境（建 .venv、清华镜像装依赖、从 npmmirror 下载匹配的 chromedriver）
+bash CNKI/run/setup_mac.sh
+
+# 2. 填机构账号（method: ip=机构网络内直连 / vpn=学校 WebVPN / school_visit）
+cp CNKI/cnki_unit_credentials.example.json CNKI/cnki_unit_credentials.json
+
+# 3. 填题录目录与输出目录
+cp CNKI/run/config.example.sh CNKI/run/config.sh
+
+# 4.（可选）只爬一部分：按发表日期 + 篇数挑子集，不改动原始题录
+.venv/bin/python CNKI/run/select_records.py --src ~/知网题录/农业科技 \
+    --dst ~/知网题录_2023前1万 --from-date 2023-01-01 --to-date 2023-12-31 --max-papers 10000
+#    然后把 config.sh 里的 RECORDS_ROOT 改成 --dst 的目录
+
+# 5. 开爬（macOS 建议加 caffeinate 防休眠）
+caffeinate -is CNKI/run/run.sh
+```
+
+- **断点续爬**：随时 `Ctrl+C`，再次运行 `run.sh` 会跳过已完成的 Excel（`.done`）和已处理的论文。
+  进度记录在题录副本 xlsx 与 PDF 文件里，不依赖日志。
+- **终端**每篇一行简短进度：`Excel 35/44 [3/60] ✓PDF | 总 7843/10000（PDF 1505，本轮未购入 0，失败 0）`；
+  完整日志追加写入 `$PDF_OUT/run_<FOLDER>.log`。
+- **输出**：`$PDF_OUT/<FOLDER>/标题_年份.pdf`；`$EXCEL_OUT/<FOLDER>/CNKI-*.xlsx`（原题录 + 作者标注 /
+  单位列表 / 作者单位对应，未购入标「机构未购入」）。
+- 默认无头（`HEADLESS=1`），第一次可设 `HEADLESS=0` 看着浏览器跑通登录。
+- 用 `ip` 登录时请关掉代理，出口 IP 要是机构的；日志开头会记录出口 IP。
+- 停止：`Ctrl+C`；后台运行时 `pkill -f run.sh; pkill -f 'cnki_excel.py --records'`。
+
 ## 文件说明
 
 ### 核心流程
@@ -80,7 +114,9 @@ python cnkiforexcel.py --doc-type none   # 不选导出类型，跳过资源类�
   Selenium 通过 `debugger_address` 连接；找不到本机 Chrome 时自动回退 chromedriver。
 - 每个新页面加载前注入 `libs/stealth.min.js`（puppeteer-extra-stealth 产物），
   抹掉 `navigator.webdriver`、WebGL 指纹等自动化特征。
-- 无头模式下用 CDP 覆盖 UA，去掉 `HeadlessChrome` 标记。
+- 无头模式下按本机系统与 Chrome 版本生成 UA，以 `--user-agent` 启动参数传入，
+  所有标签页（含下载/验证码新窗口）都去掉 `HeadlessChrome` 标记。
+- 带 `--disable-popup-blocking`：PDF 按钮是 JS 点击，否则下载窗口会被弹窗拦截。
 
 环境变量：
 
@@ -118,5 +154,7 @@ IP，出口 IP 一变就强制注销（URL 带 `logoutByIpChange=true`），表�
 - **Selenium 命令超时**（`cnki_excel.py`）：`command_executor.set_timeout(120)`，
   防止下载流僵死时主线程永久挂起。
 
-待验证（需稳定网络环境）：无头模式下点击 PDF → 文件落盘的端到端链路；
-`cnki_excel.py` 中 `[debug]` 标签页转储保留，若下载不落盘可直接从日志定位。
+- **无头修复**：补上 `--disable-popup-blocking`（JS 点击的 PDF 下载窗口曾被拦截）；
+  无头 UA 对所有标签页生效；chromedriver 回退路径同样无头；腾讯限流时
+  `ensure_captcha_passed` 返回 `'restart_browser'` 不再被误当作通过。
+  已在校园网 IP 登录下无头实测：20 篇 PDF 16 / 机构未购入 4 / 失败 0。

@@ -28,3 +28,7 @@ CNKI/Text_select_captcha/model/*.onnx
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 运行环境与本地运行配置
+.venv/
+CNKI/run/config.sh

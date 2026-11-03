@@ -25,6 +25,8 @@ code/
 
 更细的文件清单与用法见各子目录中的 `README.md`。
 
+**根据已有知网题录批量下载 PDF**：见 [`CNKI/README.md` 快速开始](CNKI/README.md)，只需改 `CNKI/run/config.sh` 与机构账号。
+
 ## 使用约定
 
 1. **工作目录**：进入对应子目录再运行脚本（同目录互相 `import` 的模块会一并找到）。
