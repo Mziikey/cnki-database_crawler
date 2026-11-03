@@ -83,6 +83,7 @@ def _create_driver(download_dir, profile_root=None):
         chrome_options.add_argument('--no-first-run')
         chrome_options.add_argument('--no-default-browser-check')
         chrome_options.add_argument('--disable-gpu')
+        chrome_launcher.apply_fallback_options(chrome_options)
         driver = webdriver.Chrome(options=chrome_options)
         chrome_launcher.inject_stealth(driver)
     chrome_launcher.set_window_size(driver)
