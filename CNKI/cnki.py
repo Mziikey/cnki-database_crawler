@@ -21,7 +21,6 @@ import time
 import random
 import gc
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from PIL import Image
 from selenium.webdriver import ActionChains
@@ -32,6 +31,8 @@ import os
 import requests
 import math
 from captcha_recognizer.recognizer import Recognizer
+
+import chrome_launcher
 
 # OCR / 缺口识别单例，避免每次验证码新建模型占内存
 _slide_ocr = None
@@ -63,12 +64,40 @@ def _build_chrome_options(download_dir):
     chrome_options.add_experimental_option('prefs', prefs)
     chrome_options.add_argument('--disk-cache-size=1')
     chrome_options.add_argument('--disable-gpu-shader-disk-cache')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--no-first-run')
-    chrome_options.add_argument('--no-default-browser-check')
     return chrome_options
+
+
+def _create_driver(download_dir, profile_root=None):
+    """优先真实 Chrome + CDP 连接（支持 CNKI_HEADLESS=1 无头），失败回退 chromedriver。"""
+    chrome_options = _build_chrome_options(download_dir)
+    try:
+        driver, proc = chrome_launcher.launch_chrome_and_connect(
+            chrome_options,
+            profile_root=profile_root,
+        )
+        globals()['_chrome_process'] = proc
+    except Exception as e:
+        print(f'chrome_launcher 启动失败，回退 chromedriver: {e}')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--no-first-run')
+        chrome_options.add_argument('--no-default-browser-check')
+        chrome_options.add_argument('--disable-gpu')
+        driver = webdriver.Chrome(options=chrome_options)
+        chrome_launcher.inject_stealth(driver)
+    chrome_launcher.set_window_size(driver)
+    chrome_launcher.set_download_dir(driver, download_dir)
+    return driver
+
+
+_chrome_process = None
+
+
+def _quit_driver(driver):
+    """关闭 driver 并结束 chrome_launcher 启动的 Chrome 进程。"""
+    global _chrome_process
+    chrome_launcher.close_launched_chrome(driver, _chrome_process)
+    _chrome_process = None
 
 
 def _release_memory():
@@ -98,7 +127,7 @@ def _open_cnki_adv_search(driver, sleep_sec=2, save_dir=None):
     else:
         driver.get(url)
     try:
-        driver.maximize_window()
+        chrome_launcher.set_window_size(driver)
     except Exception:
         pass
     if sleep_sec:
@@ -238,9 +267,6 @@ def _cleanup_captcha_images(*paths):
         except Exception:
             pass
 
-hkpathroot='D\\2024年工作\知网数据库下载\\'
-qkpathroot='D\\2024年工作\知网数据库下载\\'
-
 def huakuaicon(driver,pdfpath):
     #先找一下有没有滑块
     try:
@@ -265,12 +291,12 @@ def huakuaicon(driver,pdfpath):
     #hkpath=r'D:\2024年工作\知网数据库下载\图片\滑块图片.png'
     #qkpath=r'D:\2024年工作\知网数据库下载\图片\缺口图片.png'
     #picpath=hkpathroot+'\\'+keywords+'\pdf'+"\图片"
-    picpath = pdfpath + "\图片"
+    picpath = os.path.join(pdfpath, "图片")
 
     if not os.path.exists(picpath):
         os.makedirs(picpath)
-    hkpath = picpath + '\滑块图片.png'
-    qkpath = picpath + '\缺口图片.png'
+    hkpath = os.path.join(picpath, '滑块图片.png')
+    qkpath = os.path.join(picpath, '缺口图片.png')
 
     base64_to_image(hkimg, hkpath)
     base64_to_image(qkimg, qkpath)
@@ -308,12 +334,12 @@ def huakuaicon_v2(driver, pdfpath):
     qkimg = driver.find_element(By.ID, 'aliyunCaptcha-img').get_attribute('src')
 
     # 保存图片
-    picpath = pdfpath + "\图片"
+    picpath = os.path.join(pdfpath, "图片")
 
     if not os.path.exists(picpath):
         os.makedirs(picpath)
-    hkpath = picpath + '\滑块图片.png'
-    qkpath = picpath + '\缺口图片.png'
+    hkpath = os.path.join(picpath, '滑块图片.png')
+    qkpath = os.path.join(picpath, '缺口图片.png')
 
     url_to_image(hkimg, hkpath)
     url_to_image(qkimg, qkpath)
@@ -435,8 +461,7 @@ def cnkipaperdownpdf(keywords, keywords2):
             # 如果文件夹不存在，则创建文件夹
             os.makedirs(download_dir)
 
-        chrome_options = _build_chrome_options(download_dir)
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = _create_driver(download_dir)
 
         # driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
         # driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
@@ -599,7 +624,7 @@ def cnkipaperdownpdf(keywords, keywords2):
             count = count + 1
 
         try:
-            driver.quit()
+            _quit_driver(driver)
         except Exception:
             pass
         _release_memory()
@@ -659,8 +684,7 @@ def cnkipaperdownpdfv2(keywords):#2024.6.18完成，增加学科分类
         # 如果文件夹不存在，则创建文件夹
         os.makedirs(pdfpath)
 
-    chrome_options = _build_chrome_options(pdfpath)
-    driver = webdriver.Chrome(options=chrome_options)
+    driver = _create_driver(pdfpath)
 
     # driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
     # driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
@@ -804,8 +828,7 @@ def cnkipaperdownpdfv3(keywords):#2024.6.18完成，增加学科分类
         # 如果文件夹不存在，则创建文件夹
         os.makedirs(pdfpath)
 
-    chrome_options = _build_chrome_options(pdfpath)
-    driver = webdriver.Chrome(options=chrome_options)
+    driver = _create_driver(pdfpath)
 
     # driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
     # driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
@@ -927,8 +950,7 @@ def cnkipaperdownpdfv4(keywords): # 手动设置检索条件
             # 如果文件夹不存在，则创建文件夹
             os.makedirs(download_dir)
 
-        chrome_options = _build_chrome_options(download_dir)
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = _create_driver(download_dir)
 
         # driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
         # driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
@@ -1035,7 +1057,7 @@ def cnkipaperdownpdfv4(keywords): # 手动设置检索条件
             count = count + 1
 
         try:
-            driver.quit()
+            _quit_driver(driver)
         except Exception:
             pass
         _release_memory()
@@ -1050,11 +1072,7 @@ def cnkipaperdownpdfv5(keywords): # 手动设置检索条件
             # 如果文件夹不存在，则创建文件夹
             os.makedirs(download_dir)
 
-        chrome_options = _build_chrome_options(download_dir)
-        driver = webdriver.Chrome(
-            options=chrome_options,
-            service=Service(
-                r"D:\多模态\chromedriver-win32\chromedriver-win32\chromedriver.exe"))
+        driver = _create_driver(download_dir)
 
         # driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
         # driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
@@ -1228,7 +1246,7 @@ def cnkipaperdownpdfv5(keywords): # 手动设置检索条件
             count = count + 1
 
         try:
-            driver.quit()
+            _quit_driver(driver)
         except Exception:
             pass
         _release_memory()

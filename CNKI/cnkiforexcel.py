@@ -22,6 +22,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException
 
+import chrome_launcher
 from cnki_captcha import (
     captcha_puzzle_fingerprint,
     click_verify_done_close,
@@ -29,6 +30,7 @@ from cnki_captcha import (
     has_block_puzzle,
     has_new_download_file,
     has_visible_captcha_widget,
+    is_cnki_verify_done_page,
     is_cnki_verify_url,
     is_tencent_rate_limited,
     preload_click_captcha,
@@ -73,6 +75,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHROME_PROFILE_ROOT = os.path.join(_SCRIPT_DIR, '.chrome_profiles', 'cnki')
 CHROME_DEBUG_PORT_BASE = 9222
 _chrome_profile_dir = None
+_chrome_process = None
 
 # 机构登录方式默认值（可被 cnki_unit_credentials.json 的 method 覆盖）
 # 'vpn' = 学校 WebVPN | 'ip' = IP登录 | 'school_visit' = 校外访问
@@ -2058,6 +2061,7 @@ def try_unit_vpn_login(driver, restore_handle=None, timeout=180):
     cas_submitted = False
     cnki_clicked = False
     reached_cnki_at = None
+    portal_at = None
 
     while time.time() < deadline:
         try:
@@ -2078,6 +2082,28 @@ def try_unit_vpn_login(driver, restore_handle=None, timeout=180):
                 break
             time.sleep(1.2)
             continue
+
+        # CAS 已提交且落在门户根路径：登录态通常已生效，但门户资源块
+        # 依赖指纹采集 JS 异步加载，无头下可能一直不出现——超时直接开知网。
+        # 点过知网资源块后仍停在门户也走这里（无头下 JS 点击偶尔不生效，
+        # 既不开新标签也不导航），每 15 秒重试一次直接导航
+        if (cas_submitted
+                and is_webvpn_url(url)
+                and not is_webvpn_portal_login_url(url)
+                and '/cas/login' not in url.lower()
+                and not _is_cnki_via_webvpn(url)):
+            if portal_at is None:
+                portal_at = time.time()
+            elif time.time() - portal_at >= 15:
+                print('WebVPN: 门户未跳转到知网，直接打开知网验证登录态...')
+                try:
+                    driver.get(to_webvpn_url('https://www.cnki.net/'))
+                    cnki_clicked = True
+                    portal_at = None
+                    time.sleep(3)
+                    continue
+                except Exception as e:
+                    print('WebVPN: 直接打开知网失败:', e)
 
         if not cas_entry_clicked and _click_webvpn_cas_entry(driver):
             cas_entry_clicked = True
@@ -2107,7 +2133,10 @@ def try_unit_vpn_login(driver, restore_handle=None, timeout=180):
 
         time.sleep(1.2)
     else:
-        print('WebVPN 登录超时')
+        try:
+            print(f'WebVPN 登录超时（最终页面: {driver.current_url}）')
+        except Exception:
+            print('WebVPN 登录超时')
         return False
 
     keep = _close_webvpn_extra_windows(driver)
@@ -3063,7 +3092,7 @@ def recreate_browser_after_rate_limit(driver, download_dir, doc_type=None):
     new_driver = create_chrome_driver(download_dir)
     open_cnki_url(new_driver, get_adv_search_url(doc_type))
     try:
-        new_driver.maximize_window()
+        chrome_launcher.set_window_size(new_driver)
     except Exception:
         pass
     login_ok = ensure_unit_login_if_needed(
@@ -5791,7 +5820,7 @@ def run_export_task(driver, task, task_index, task_total):
     driver = create_chrome_driver(download_dir)
     open_cnki_url(driver, get_adv_search_url(doc_type))
     try:
-        driver.maximize_window()
+        chrome_launcher.set_window_size(driver)
     except Exception:
         pass
     login_ok = ensure_unit_login_if_needed(
@@ -5919,12 +5948,16 @@ def cnkipaperfordatav4():
 
 
 def create_chrome_driver(download_dir):
-    """创建独立 Chrome 实例，可与 SCI 脚本并行。"""
-    global _chrome_profile_dir
+    """创建独立 Chrome 实例，可与 SCI 脚本并行。
+
+    优先走 chrome_launcher（真实 Chrome + CDP 连接 + stealth 注入，
+    支持 CNKI_HEADLESS=1 无头模式）；找不到本机 Chrome 时自动回退
+    chromedriver 模式。
+    """
+    global _chrome_profile_dir, _chrome_process
     os.makedirs(CHROME_PROFILE_ROOT, exist_ok=True)
     _chrome_profile_dir = tempfile.mkdtemp(
         prefix=f'cnki_{os.getpid()}_', dir=CHROME_PROFILE_ROOT)
-    debug_port = CHROME_DEBUG_PORT_BASE + (os.getpid() % 400)
     cache_dir = os.path.join(_chrome_profile_dir, 'Cache')
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -5939,21 +5972,32 @@ def create_chrome_driver(download_dir):
     chrome_options.add_argument(f'--disk-cache-dir={cache_dir}')
     chrome_options.add_argument('--disk-cache-size=1')
     chrome_options.add_argument('--disable-gpu-shader-disk-cache')
-    chrome_options.add_argument(f'--remote-debugging-port={debug_port}')
-    chrome_options.add_argument('--no-first-run')
-    chrome_options.add_argument('--no-default-browser-check')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    print(f'Chrome profile: {_chrome_profile_dir} | debug-port={debug_port}')
-    driver = webdriver.Chrome(options=chrome_options)
+    print(f'Chrome profile: {_chrome_profile_dir}')
+    try:
+        driver, proc = chrome_launcher.launch_chrome_and_connect(
+            chrome_options,
+            profile_root=CHROME_PROFILE_ROOT,
+            port_base=CHROME_DEBUG_PORT_BASE,
+        )
+        _chrome_process = proc
+    except Exception as e:
+        print(f'chrome_launcher 启动失败，回退 chromedriver: {e}')
+        chrome_options.add_argument('--no-first-run')
+        chrome_options.add_argument('--no-default-browser-check')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        driver = webdriver.Chrome(options=chrome_options)
+        chrome_launcher.inject_stealth(driver)
+    chrome_launcher.set_window_size(driver)
     set_chrome_download_dir(driver, download_dir)
     return driver
 
 
 def cleanup_chrome_profile():
-    """退出时清理本进程临时 profile。"""
-    global _chrome_profile_dir
+    """退出时清理本进程临时 profile，并结束 chrome_launcher 启动的 Chrome。"""
+    global _chrome_profile_dir, _chrome_process
+    chrome_launcher.close_launched_chrome(None, _chrome_process)
+    _chrome_process = None
     if not _chrome_profile_dir:
         return
     path = _chrome_profile_dir
@@ -6193,7 +6237,7 @@ def cnkipaperfordata(keywords, keywords2):
     #driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
     #driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
     driver.get(get_adv_search_url())
-    driver.maximize_window()  # 最大化窗口
+    chrome_launcher.set_window_size(driver)  # 最大化窗口
     time.sleep(3)
     ensure_unit_login_if_needed(driver, restore_handle=driver.current_window_handle)
     select_eleddlist=driver.find_element(By.ID, 'gradetxt').find_elements(By.CSS_SELECTOR, 'dd')
@@ -6491,7 +6535,7 @@ def cnkipaperfordatav2(text):
     #driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
     #driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
     driver.get(get_adv_search_url())
-    driver.maximize_window()  # 最大化窗口
+    chrome_launcher.set_window_size(driver)  # 最大化窗口
     time.sleep(3)
     ensure_unit_login_if_needed(driver, restore_handle=driver.current_window_handle)
     select_eleddlist=driver.find_element(By.ID, 'gradetxt').find_elements(By.CSS_SELECTOR, 'dd')
@@ -6616,7 +6660,7 @@ def cnkipaperfordatav3(keywords):
     #driver = webdriver.Chrome('F:\ChromDriver\chromedriver_win32\chromedriver.exe')
     #driver.get('https://kns.cnki.net/KNS8/AdvSearch?dbcode=SCOD&searchType=majorSearch')
     driver.get(get_adv_search_url())
-    driver.maximize_window()  # 最大化窗口
+    chrome_launcher.set_window_size(driver)  # 最大化窗口
     ensure_unit_login_if_needed(driver, restore_handle=driver.current_window_handle)
 
     # 等待手动输入检索条件
@@ -7064,7 +7108,7 @@ def run_fill_mode(
                 driver = create_chrome_driver(download_dir)
                 open_cnki_url(driver, get_adv_search_url(fill_doc_type))
                 try:
-                    driver.maximize_window()
+                    chrome_launcher.set_window_size(driver)
                 except Exception:
                     pass
                 login_ok = ensure_unit_login_if_needed(

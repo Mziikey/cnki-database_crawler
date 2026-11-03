@@ -46,6 +46,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+import chrome_launcher
 from cnki_captcha import (
     TENCENT_RATE_LIMIT_SLEEP,
     TENCENT_RELOGIN_RETRIES,
@@ -81,6 +82,7 @@ CHROME_PROFILE_ROOT = _SCRIPT_DIR / '.chrome_profiles' / 'cnki_excel'
 CHROME_DEBUG_PORT_BASE = 9224
 
 PAGE_TIMEOUT = 30
+COMMAND_TIMEOUT = 120
 MAX_RETRY = 3
 NEW_WINDOW_WAIT = 15
 PDF_WAIT = 90
@@ -127,7 +129,7 @@ CNKI_URL_PREFIXES = (
 )
 
 _chrome_profile_dir = None
-_debug_port_seq = 0
+_chrome_process = None
 
 
 def _setup_stdio():
@@ -632,16 +634,6 @@ def relative_category(excel_path: Path, records_root: Path) -> Path:
 # ---------------------------------------------------------------------------
 # 浏览器
 # ---------------------------------------------------------------------------
-def _next_debug_port() -> int:
-    global _debug_port_seq
-    _debug_port_seq += 1
-    port = CHROME_DEBUG_PORT_BASE + (os.getpid() % 80) + _debug_port_seq * 3
-    if port > 60999:
-        _debug_port_seq = 1
-        port = CHROME_DEBUG_PORT_BASE + 11
-    return port
-
-
 def _force_quit_driver(driver) -> None:
     if driver is None:
         return
@@ -709,12 +701,15 @@ def _kill_chrome_by_profile(profile_dir: str | None) -> None:
 
 def _force_kill_browser(driver=None) -> None:
     """quit → 杀 chromedriver/chrome 进程树 → 清 profile。限流等待前必须先调用。"""
+    global _chrome_process
     profile = _chrome_profile_dir
     pids = set()
     pid = _driver_chromedriver_pid(driver)
     if pid:
         pids.add(pid)
     _force_quit_driver(driver)
+    chrome_launcher.close_launched_chrome(None, _chrome_process)
+    _chrome_process = None
     time.sleep(0.4)
     for p in list(pids):
         _kill_pid_tree(p)
@@ -724,7 +719,7 @@ def _force_kill_browser(driver=None) -> None:
 
 
 def create_driver(download_dir: Path):
-    global _chrome_profile_dir
+    global _chrome_profile_dir, _chrome_process
     download_dir = Path(download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
     abs_dir = str(download_dir.resolve())
@@ -732,7 +727,6 @@ def create_driver(download_dir: Path):
     CHROME_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
     _chrome_profile_dir = tempfile.mkdtemp(
         prefix=f'cnki_excel_{os.getpid()}_', dir=str(CHROME_PROFILE_ROOT))
-    debug_port = _next_debug_port()
     cache_dir = os.path.join(_chrome_profile_dir, 'Cache')
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -750,20 +744,29 @@ def create_driver(download_dir: Path):
     chrome_options.add_argument(f'--disk-cache-dir={cache_dir}')
     chrome_options.add_argument('--disk-cache-size=1')
     chrome_options.add_argument('--disable-gpu-shader-disk-cache')
-    chrome_options.add_argument(f'--remote-debugging-port={debug_port}')
-    chrome_options.add_argument('--no-first-run')
-    chrome_options.add_argument('--no-default-browser-check')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--enable-unsafe-swiftshader')
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
     chrome_options.add_argument(
         '--disable-features=ScreenAI,PdfOcr,LiveCaption,ReadAnything')
-    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    print(f'Chrome profile: {_chrome_profile_dir} | debug-port={debug_port}')
-    driver = webdriver.Chrome(options=chrome_options)
+    print(f'Chrome profile: {_chrome_profile_dir}')
+    try:
+        driver, proc = chrome_launcher.launch_chrome_and_connect(
+            chrome_options,
+            profile_root=str(CHROME_PROFILE_ROOT),
+            port_base=CHROME_DEBUG_PORT_BASE,
+        )
+        _chrome_process = proc
+    except Exception as e:
+        print(f'chrome_launcher 启动失败，回退 chromedriver: {e}')
+        chrome_options.add_argument('--no-first-run')
+        chrome_options.add_argument('--no-default-browser-check')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        driver = webdriver.Chrome(options=chrome_options)
+        chrome_launcher.inject_stealth(driver)
     try:
         svc = getattr(driver, 'service', None)
         proc = getattr(svc, 'process', None) if svc else None
@@ -772,18 +775,21 @@ def create_driver(download_dir: Path):
     except Exception:
         pass
     driver.set_page_load_timeout(PAGE_TIMEOUT)
+    # Selenium 命令级超时：chromedriver 偶发不响应（如下载流僵死时），
+    # 不设超时会让主线程永久挂在 select 上
     try:
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
-        })
+        driver.command_executor.set_timeout(COMMAND_TIMEOUT)
     except Exception:
         pass
+    chrome_launcher.set_window_size(driver)
     set_chrome_download_dir(driver, abs_dir)
     return driver
 
 
 def cleanup_chrome_profile():
-    global _chrome_profile_dir
+    global _chrome_profile_dir, _chrome_process
+    chrome_launcher.close_launched_chrome(None, _chrome_process)
+    _chrome_process = None
     if not _chrome_profile_dir:
         return
     path = _chrome_profile_dir
@@ -1358,10 +1364,7 @@ def pass_captcha_and_login(
 def prepare_session(driver, save_dir: Path) -> None:
     driver.get(get_login_home_url())
     time.sleep(2)
-    try:
-        driver.maximize_window()
-    except Exception:
-        pass
+    chrome_launcher.set_window_size(driver)
     main_handle = driver.current_window_handle
     pass_captcha_and_login(driver, save_dir, main_handle)
     print('浏览器会话已就绪（验证码/机构登录）')
@@ -1538,6 +1541,25 @@ def wait_detail_ready(driver, timeout=12) -> bool:
         return False
 
 
+def on_article_detail_page(driver) -> bool:
+    """当前页是否真的是文献详情页（WebVPN 重认证后常被带离）。"""
+    try:
+        url = driver.current_url or ''
+        inner = unwrap_webvpn_url(url)
+        for u in (url, inner):
+            path = (u or '').lower()
+            if ('/kcms2/article/abstract' in path
+                    or '/kcms/detail/' in path
+                    or 'article/abstract' in path):
+                return True
+        return bool(
+            driver.find_elements(By.ID, 'authorpart')
+            or driver.find_elements(By.CSS_SELECTOR, 'div.wx-tit')
+        )
+    except Exception:
+        return False
+
+
 def extract_author_org(driver) -> dict:
     """从知网详情页 wx-tit 提取作者上标与单位编号对应关系。"""
     try:
@@ -1560,6 +1582,29 @@ def extract_author_org(driver) -> dict:
             if text:
                 orgs[str(key)] = text
     return {'authors': authors, 'orgs': orgs}
+
+
+def _dump_tabs_debug(driver, tag):
+    """临时调试：转储所有标签页 URL 和下载目录内容，定位下载未触发问题。"""
+    current = None
+    try:
+        current = driver.current_window_handle
+    except Exception:
+        pass
+    try:
+        for h in list(driver.window_handles):
+            try:
+                driver.switch_to.window(h)
+                print(f'    [debug {tag}] tab {h[:8]}: {driver.current_url}')
+            except Exception as e:
+                print(f'    [debug {tag}] tab {h[:8]}: <不可读 {e}>')
+    except Exception:
+        pass
+    if current and current in driver.window_handles:
+        try:
+            driver.switch_to.window(current)
+        except Exception:
+            pass
 
 
 def download_paper(
@@ -1585,6 +1630,7 @@ def download_paper(
     meta = {}
     paper_before = None
     click_time = None
+    saw_pdf_button = False
     for attempt in range(1, MAX_RETRY + 1):
         try:
             if not ensure_session_window(driver):
@@ -1660,7 +1706,21 @@ def download_paper(
                     ensure_single_main_tab(driver)
                 return 'ok', meta
 
-            if not has_pdf_download_button(driver):
+            if has_pdf_download_button(driver):
+                saw_pdf_button = True
+            else:
+                # 前几轮见过 PDF 按钮：权限没问题，只是本轮页面异常（如
+                # WebVPN 重认证后页面被带离），不能误标「无PDF」
+                if saw_pdf_button:
+                    print(f'    曾见 PDF 按钮，本轮页面异常（尝试 {attempt}/{MAX_RETRY}）')
+                    ensure_single_main_tab(driver)
+                    time.sleep(2)
+                    continue
+                if not on_article_detail_page(driver):
+                    print(f'    不在详情页（登录跳转后页面丢失），重试（尝试 {attempt}/{MAX_RETRY}）')
+                    ensure_single_main_tab(driver)
+                    time.sleep(2)
+                    continue
                 if is_catalog_only_page(driver):
                     print('    该条为仅题录，无 PDF，标记后跳过')
                     status = 'catalog_only'
@@ -1684,23 +1744,22 @@ def download_paper(
                 except Exception:
                     now_u = ''
                 print(
-                    f'    未找到 PDF 下载按钮（尝试 {attempt}/{MAX_RETRY}）'
+                    f'    点击 PDF 按钮失败（尝试 {attempt}/{MAX_RETRY}）'
                     f' 当前页: {now_u}'
                 )
                 if is_cnki_404_page(driver):
                     print('    网址失效 404，标记后跳过')
                     ensure_single_main_tab(driver)
                     return 'not_found', meta
-                if is_catalog_only_page(driver):
-                    print('    未找到 PDF 且为仅题录，标记后跳过，不再重试')
-                    ensure_single_main_tab(driver)
-                    return 'catalog_only', meta
-                print('    无 PDF 下载按钮，标记后跳过，不再重试')
+                # 按钮刚被确认存在，点击失败是瞬时问题（页面跳转/重认证），
+                # 不允许据此标记 no_pdf/catalog_only
                 ensure_single_main_tab(driver)
-                return 'no_pdf', meta
+                time.sleep(2)
+                continue
 
             wait_for_new_window(driver, before_handles, timeout=8)
             time.sleep(1.0)
+            _dump_tabs_debug(driver, f'点击后（尝试 {attempt}/{MAX_RETRY}）')
             if has_visible_captcha_anywhere(driver) or has_unit_login_anywhere(driver):
                 if has_visible_captcha_anywhere(driver):
                     print('    检测到下载验证码页，开始处理...')
@@ -1749,14 +1808,14 @@ def download_paper(
                 return 'ok', meta
 
             print(f'    等待 PDF 超时（尝试 {attempt}/{MAX_RETRY}）')
+            _dump_tabs_debug(driver, f'超时（尝试 {attempt}/{MAX_RETRY}）')
             if not has_pdf_download_button(driver):
-                if is_catalog_only_page(driver):
-                    print('    等待超时且无 PDF 按钮（仅题录），标记后跳过')
-                    ensure_single_main_tab(driver)
-                    return 'catalog_only', meta
-                print('    等待超时且无 PDF 按钮，标记后跳过，不再重试')
+                # 已点击过下载按钮（saw_pdf_button=True），超时后按钮消失
+                # 多为 WebVPN 会话/页面状态问题，不能误标「无PDF」
+                print('    下载已触发但按钮消失（页面状态异常），继续等待重试')
                 ensure_single_main_tab(driver)
-                return 'no_pdf', meta
+                time.sleep(2)
+                continue
             pdf = find_new_pdf(
                 download_dir, paper_before or set(),
                 since_ts=click_time, dest_pdf=dest_pdf)
